@@ -19,6 +19,7 @@ Original file is located at
 import os
 import textwrap
 from pathlib import Path
+import asyncio  # Import asyncio
 from decouple import config
 from IPython.display import Markdown
 from langchain.chains import RetrievalQA
@@ -38,6 +39,7 @@ os.environ["GROQ_API_KEY"] = config(
 )
 
 
+
 def print_response(response):
     response_txt = response["result"]
     for chunk in response_txt.split("\n"):
@@ -46,17 +48,6 @@ def print_response(response):
             continue
         print("\n".join(textwrap.wrap(chunk, 100, break_long_words=False)))
 
-"""### Get all the books you want into a folder we are going to use
-
-- put all the books in the folder called Data/booos
-
-
-"""
-
-# get al lthe books
-# !mkdir data
-
-"""Create custom instructions for the model to be able to work wint the pdfs we are providing to the model, eg, all the books we need to use"""
 
 instruction = """
 The provided documents contain comprehensive medical information about various drugs, their administration, potential allergic reactions, perceptions on how to take the drugs, and other related medical data.
@@ -70,33 +61,28 @@ Your task is to:
 Load and process all the provided PDFs to extract this information.
 """
 
-
-# List of PDF files to be loaded
 pdf_files = [
-   '/content/NLEM.pdf',
-   '/content/data.pdf',
-   '/content/data1.pdf',
-   '/content/data2.pdf',
-   '/content/data3.pdf',
-   '/content/data4.pdf',
-   '/content/data5.pdf',
-   '/content/data6.pdf',
-   '/content/data7.pdf',
-   '/content/data8.pdf',
-   '/content/data9.pdf',
+   'content/NLEM.pdf',
+   'content/data.pdf',
+   'content/data1.pdf',
+   'content/data2.pdf',
+   'content/data3.pdf',
+   'content/data4.pdf',
+   'content/data5.pdf',
+   'content/data6.pdf',
+   'content/data7.pdf',
+   'content/data8.pdf',
+   'content/data9.pdf',
 ]
 
-
-# Initialize the parser with the provided instruction
 parser = LlamaParse(
-    api_key= config('LLAMA_PARSE'),
+    api_key=config('LLAMA_PARSE'),
     result_type="markdown",
     parsing_instruction=instruction,
     max_timeout=5000,
 )
 
 
-# Function to load and parse all PDF files
 async def load_all_pdfs(pdf_files):
     llama_parse_documents = []
     for pdf_file in pdf_files:
@@ -104,112 +90,98 @@ async def load_all_pdfs(pdf_files):
         llama_parse_documents.append(parsed_data)
     return llama_parse_documents
 
-# Call the function to load and parse all PDFs
-llama_parse_documents = load_all_pdfs(pdf_files)
 
-# llama_parse_documents = await parser.aload_data("./book2.pdf")
+async def main():
+    llama_parse_documents = await load_all_pdfs(pdf_files)
 
-parsed_doc = llama_parse_documents[0]
+    parsed_doc = llama_parse_documents[0]
+    print(parsed_doc)
 
-print(parsed_doc)
+    document_path = Path("data/parsed_document.md")
+    with document_path.open("a") as f:
+        f.write(parsed_doc[0].text)
 
-Markdown(parsed_doc[0].text[:-1])
+    loader = UnstructuredMarkdownLoader(document_path)
+    loaded_documents = loader.load()
 
-document_path = Path("data/parsed_document.md")
-with document_path.open("a") as f:
-    f.write(parsed_doc[0].text)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2048, chunk_overlap=128)
+    docs = text_splitter.split_documents(loaded_documents)
+    print(docs[0].page_content)
 
-loader = UnstructuredMarkdownLoader(document_path)
-loaded_documents = loader.load()
+    embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-base-en-v1.5")
 
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=2048, chunk_overlap=128)
-docs = text_splitter.split_documents(loaded_documents)
-len(docs)
+    qdrant = Qdrant.from_documents(
+        docs,
+        embeddings,
+        path="./db",
+        collection_name="document_embeddings",
+    )
 
-print(docs[0].page_content)
+    query = "What is Lithium Carbonate used for ?"
+    similar_docs = qdrant.similarity_search_with_score(query)
 
-embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+    for doc, score in similar_docs:
+        print(f"text: {doc.page_content[:256]}\n")
+        print(f"score: {score}")
+        print("-" * 80)
+        print()
 
-qdrant = Qdrant.from_documents(
-    docs,
-    embeddings,
-    # location=":memory:",
-    path="./db",
-    collection_name="document_embeddings",
-)
+    retriever = qdrant.as_retriever(search_kwargs={"k": 5})
+    retrieved_docs = retriever.invoke(query)
 
-# Commented out IPython magic to ensure Python compatibility.
-# 
+    for doc in retrieved_docs:
+        print(f"id: {doc.metadata['_id']}\n")
+        print(f"text: {doc.page_content[:256]}\n")
+        print("-" * 80)
+        print()
 
-query = "What is Lithium Carbonate used for ?"
-similar_docs = qdrant.similarity_search_with_score(query)
+    compressor = FlashrankRerank(model="ms-marco-MiniLM-L-12-v2")
+    compression_retriever = ContextualCompressionRetriever(
+        base_compressor=compressor, base_retriever=retriever
+    )
 
-for doc, score in similar_docs:
-    print(f"text: {doc.page_content[:256]}\n")
-    print(f"score: {score}")
-    print("-" * 80)
-    print()
+    reranked_docs = compression_retriever.invoke(query)
 
-# Commented out IPython magic to ensure Python compatibility.
-# %%time
-retriever = qdrant.as_retriever(search_kwargs={"k": 5})
-retrieved_docs = retriever.invoke(query)
+    for doc in reranked_docs:
+        print(f"id: {doc.metadata['_id']}\n")
+        print(f"text: {doc.page_content[:256]}\n")
+        print(f"score: {doc.metadata['relevance_score']}")
+        print("-" * 80)
+        print()
 
-for doc in retrieved_docs:
-    print(f"id: {doc.metadata['_id']}\n")
-    print(f"text: {doc.page_content[:256]}\n")
-    print("-" * 80)
-    print()
+    llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
 
-compressor = FlashrankRerank(model="ms-marco-MiniLM-L-12-v2")
-compression_retriever = ContextualCompressionRetriever(
-    base_compressor=compressor, base_retriever=retriever
-)
+    prompt_template = """
+    Use the following pieces of information to answer the user's question.
+    If you don't know the answer, just say that you don't know, don't try to make up an answer.
 
-# Commented out IPython magic to ensure Python compatibility.
-# %%time
-reranked_docs = compression_retriever.invoke(query)
-len(reranked_docs)
+    Context: {context}
+    Question: {question}
 
-for doc in reranked_docs:
-    print(f"id: {doc.metadata['_id']}\n")
-    print(f"text: {doc.page_content[:256]}\n")
-    print(f"score: {doc.metadata['relevance_score']}")
-    print("-" * 80)
-    print()
+    Answer the question and provide additional helpful information,
+    based on the pieces of information, if applicable. Be succinct.
 
-# Create llm
-llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
+    Responses should be properly formatted to be easily read.
+    """
 
-prompt_template = """
-Use the following pieces of information to answer the user's question.
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
+    prompt = PromptTemplate(
+        template=prompt_template, input_variables=["context", "question"]
+    )
 
-Context: {context}
-Question: {question}
+    qa = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=compression_retriever,
+        return_source_documents=True,
+        chain_type_kwargs={"prompt": prompt, "verbose": True},
+    )
 
-Answer the question and provide additional helpful information,
-based on the pieces of information, if applicable. Be succinct.
+    response = qa.invoke("What is Lithium Carbonate used for ?")
+    print_response(response)
 
-Responses should be properly formatted to be easily read.
-"""
-
-prompt = PromptTemplate(
-    template=prompt_template, input_variables=["context", "question"]
-)
-
-qa = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=compression_retriever,
-    return_source_documents=True,
-    chain_type_kwargs={"prompt": prompt, "verbose": True},
-)
-
-# Commented out IPython magic to ensure Python compatibility.
-# %%time
-response = qa.invoke("What is Lithium Carbonate used for ?")
-
-print_response(response)
+    response = qa.invoke("What is Lithium Carbonate used for and what dosages can I take for a child in their teens")
+    print_response(response)
 
 
+if __name__ == "__main__":
+    asyncio.run(main())
